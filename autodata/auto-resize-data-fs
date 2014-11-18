@@ -1,0 +1,257 @@
+#!/usr/bin/env python
+#
+# Opinionated script to automatically manage the size of a single LV
+# with a known filesystem type.
+#
+# Designed with the intention that all data will be stored in this LV, mounted
+# under /data (though this is not prescribed here)
+#
+# If new storage is added to the machine as an 'sd' device, it will be claimed
+# by this VG, and the data LV extended to utilise the new space.
+#
+# A 'reserved PE percentage' (default 10%) can be used to keep some space unallocated,
+# largely to allow for snapshot LVs to be created, but also can be handy in emergency situations.
+#
+# Use of LVM to handle multiple spindles is enforced - it gives a common set of operations and
+# gives useful benefits when handling detachable storage such as vCD independent disks or AWS
+# EBS volumes.
+#
+
+import re
+import subprocess
+
+def get_valid_disks(matcher_re, blacklist):
+    valid_disks = []
+    partitions_file = '/proc/partitions'
+    partitions = open(partitions_file, 'r').readlines()
+    for partition_line in partitions:
+        line = partition_line.rstrip()
+        if matcher_re.match(line):
+            part_info = line.split()
+            valid_disks.append(part_info[3])
+    return valid_disks
+
+
+def full_device_path(device):
+    if re.match('^/dev/', device):
+        return device
+    else:
+        return "/dev/" + device
+
+
+def is_pv_enabled_on_device(device):
+    full_device = full_device_path(device)
+    ret = subprocess.call(['pvs', full_device])
+    if ret == 5:
+        # not present
+        return False
+    elif ret == 0:
+        # all good
+        return True
+    else:
+        raise RuntimeError(
+            "Unexpected return code received from pvs: {}".format(ret))
+
+
+def does_vg_exist(vg_name):
+    full_device = full_device_path(vg_name)
+    vgck_ret = subprocess.call(['vgck', full_device])
+    if vgck_ret == 5:
+        # not present
+        return False
+    elif vgck_ret == 0:
+        # all good
+        return True
+    else:
+        raise RuntimeError(
+            "Unexpected return code received from vgck: {}".format(vgck_ret))
+
+
+def is_pv_in_vg(vg_name, pv):
+    full_pv = full_device_path(pv)
+    pvs_out = subprocess.check_output([
+        'pvs', '--separator', ',', '--noheadings', '--options', 'vg_name', full_pv
+    ])
+    if re.search('^\s+{}$'.format(vg_name), pvs_out):
+        return True
+    elif re.search('^\s+$', pvs_out):
+        return False
+    else:
+        m = re.search('^\s+(.+)$', pvs_out)
+        if m is not None:
+            raise RuntimeError(
+                "PV {} is not in VG {} - it is already in VG {}.".format(full_pv, vg_name, m.group(1)))
+        else:
+            raise RuntimeError("Unexpected output from pvs when checking for {} in {}".format(
+                vg_name, pvs_out))
+
+
+def is_lv_in_vg(vg_name, lv_name):
+    full_lv_device = full_device_path("{}/{}".format(vg_name, lv_name))
+    ret = subprocess.call([
+      'lvs', '--separator', ',', '--noheadings', full_lv_device
+    ])
+    if ret == 5:
+        # not present
+        return False
+    elif ret == 0:
+        # all good
+        return True
+    else:
+        raise RuntimeError(
+            "Unexpected return code received from lvs: {}".format(ret))
+
+
+def pvcreate(device):
+    full_device = full_device_path(device)
+    ret = subprocess.call(['pvcreate', full_device])
+    if ret != 0:
+        raise RuntimeError("Failed to pvcreate {}".format(full_device))
+
+
+def vgcreate(vg_name, pvs):
+    full_pv_list = map(full_device_path, pvs)
+    cmd = ['vgcreate', vg_name] + full_pv_list
+    print cmd
+    ret = subprocess.call(cmd)
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to vgcreate {} containing {}".format(vg_name, pvs))
+
+
+def vgextend_with_new_pvs(vg_name, pvs):
+    for pv in pvs:
+        if not is_pv_in_vg(vg_name, pv):
+            print "Extending VG {} with {}".format(vg_name, full_device_path(pv))
+            vgextend(vg_name, pv)
+
+
+def vgextend(vg_name, pv):
+    full_device = full_device_path(pv)
+    ret = subprocess.call(['vgextend', vg_name, full_device])
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to vgextend {} with {}".format(vg_name, full_device))
+
+
+def lvcreate(vg_name, lv_name, available_pe):
+    ret = subprocess.call(['lvcreate', '-n', lv_name,
+                           '-l', '{}'.format(available_pe), vg_name])
+    if ret != 0:
+        raise RuntimeError("Failed to lvcreate {} in {} with {} PEs".format(
+            lv_name, vg_name, available_pe))
+
+
+def lvextend(vg_name, lv_name, available_pe):
+    full_device = full_device_path(vg_name + "/" + lv_name)
+    ret = subprocess.call(['lvextend',
+                           '-l', '+{}'.format(available_pe), full_device])
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to lvextend {} by {}".format(full_device, available_pe))
+
+
+def vg_free_pe(vg_name, reserved_percent):
+    vgs_out = subprocess.check_output([
+      'vgs', '--noheading', '--separator', ',',
+      '--options', 'vg_free_count,vg_extent_count', vg_name
+    ])
+    matcher = re.search('^\s+(\d+),(\d+)', vgs_out)
+    if matcher is not None:
+        free_pe = int(matcher.group(1))
+        total_pe = int(matcher.group(2))
+        reserved_pe = total_pe * reserved_percent / 100
+        if (free_pe - reserved_pe > 0):
+            return free_pe - reserved_pe
+        else:
+            return 0
+    else:
+        raise RuntimeError(
+            "Cannot process output of vgs: {}".format(vgs_out))
+
+
+def mkfs(device, fs_type):
+    ret = subprocess.call(['mkfs', '-t', fs_type, device])
+    if ret != 0:
+        raise RuntimeError("Failed to mkfs {} as {}".format(device, fs_type))
+
+
+def extendfs(device, fs_type):
+    if (fs_type == 'ext3' or fs_type == 'ext4'):
+        command = ['resize2fs', device]
+    elif (fs_type == 'btrfs'):
+        command = ['btrfs', 'filesystem', 'resize', 'max', device]
+    else:
+        print "Do not know how to resize {} filesystem type"
+        return
+
+    ret = subprocess.call(command)
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to extend {} filesystem on {}".format(fs_type, device))
+
+
+def nothing_to_do(msg=None):
+    if msg:
+        print msg
+    exit(0)
+
+# -----------------------------------------------------------------------
+
+if __name__ == '__main__':
+
+    # variables that we could concievably treat as config
+    matching_disks_re = re.compile('.+\s(sd[b-z]|xvd[f-z])$')
+    blacklist_disks = []
+    vg_name = "vg_autodata"
+    lv_name = "lv_data"
+    reserved_pe_percent = 10
+    fs_type = "ext4"  # ext4, btrfs, ext3?, xfs?, 'IGNORE'...
+
+    # Get a list of available disks
+    disks = get_valid_disks(matching_disks_re, blacklist_disks)
+    if len(disks) == 0:
+        nothing_to_do()
+
+    # pvcreate them if they are not already PVs
+    for device in disks:
+        if not is_pv_enabled_on_device(device):
+            print "Turning {} into a PV using pvcreate".format(device)
+            pvcreate(device)
+            if not is_pv_enabled_on_device(device):
+                raise RuntimeError("Could not pvcreate {}".format(device))
+
+    # Either create or extend the VG
+    if does_vg_exist(vg_name):
+        # is idempotent, so won't do anything if pvs are already in vg
+        vgextend_with_new_pvs(vg_name, disks)
+    else:
+        print "VG {} does not exist. Creating containing {}.".format(vg_name, disks)
+        vgcreate(vg_name, disks)
+
+    # Check for available space to extend into
+    free_pe = vg_free_pe(vg_name, reserved_pe_percent)
+    if free_pe > 0:
+        # we can increase
+        print "We can increase/create {} with {} PE".format(vg_name + "/" + lv_name, free_pe)
+    else:
+        # no space to extend into
+        nothing_to_do()
+
+    # check for existence of our LV
+    if not is_lv_in_vg(vg_name, lv_name):
+        print "Creating our new LV: {}".format(vg_name + "/" + lv_name)
+        newly_created_lv = True
+        lvcreate(vg_name, lv_name, free_pe)
+    else:
+        print "Extending our LV: {}".format(vg_name + "/" + lv_name)
+        newly_created_lv = False
+        lvextend(vg_name, lv_name, free_pe)
+
+    if fs_type != "IGNORE":
+        if newly_created_lv:
+            # create new filesystem
+            mkfs(full_device_path(vg_name + "/" + lv_name), fs_type)
+        else:
+            # extend existing filesystem, if we know how
+            extendfs(full_device_path(vg_name + "/" + lv_name), fs_type)

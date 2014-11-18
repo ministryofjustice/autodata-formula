@@ -1,0 +1,10 @@
+{% set autodata = salt['grains.filter_by']({
+    'Debian': {
+        'lv_name': 'lv_data',
+        'vg_name': 'vg_autodata',
+        'fs_type': 'ext4',
+        'mount_point': '/data',
+        'mount_options': 'rw,noatime',
+    },
+    'default': 'Debian',
+}, merge=salt['pillar.get']('autodata',{})) %}
