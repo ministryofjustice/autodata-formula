@@ -1,5 +1,9 @@
 {% from "autodata/map.jinja" import autodata with context %}
 
+autodata-lvm2:
+  pkg.installed:
+    - name: lvm2
+
 # we expect that our mount point will be created elsewhere, but
 # this should be independent of that.
 # If it is not present, create it, and then future operations will
@@ -22,6 +26,7 @@ run_auto_resize:
    - require:
      - file: /usr/local/bin/auto-resize-data-fs
      - cmd: ensure_mount_point_created
+     - pkg: autodata-lvm2
 
 #
 # run unless there already an fstab entry

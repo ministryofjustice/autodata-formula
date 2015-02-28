@@ -1,3 +1,7 @@
+## Unreleased
+
+* Add missing `lvm2` package dependency
+
 ## v0.1.0
 
 * Initial version of salt setup
