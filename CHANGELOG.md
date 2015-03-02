@@ -1,4 +1,4 @@
-## Unreleased
+## v0.1.1
 
 * Add missing `lvm2` package dependency
 
